@@ -1,5 +1,7 @@
 use std::env::current_dir;
 use std::ffi::OsString;
+use std::process::Command;
+use std::thread;
 use std::time::Duration;
 
 use eframe::App;
@@ -125,7 +127,8 @@ pub fn main() {
         input_image_bi1_rx: None, 
         input_image_bi2_rx: None, 
         output_image_bi_rx: None,
-        movable_image_display: false, 
+        movable_image_display: false,
+        extra_arguments: String::new(), 
     }; 
     let mut native_options = eframe::NativeOptions::default(); 
     native_options.initial_window_size = Some(egui::Vec2::new(1024.0, 768.0)); 
@@ -175,6 +178,8 @@ pub struct MyApp {
     pub output_image_bi_rx: Option<oneshot::Receiver<(ImageBuffer<Rgba<u8>, Vec<u8>>, String)>>, 
     /// 可移除已经装载的任务
     pub movable_image_display: bool, 
+    /// 额外参数
+    pub extra_arguments: String, 
 }
 
 impl App for MyApp {
@@ -211,6 +216,44 @@ impl App for MyApp {
                 } 
             },
             None => {},
+        }
+        match self.input_image_bi1_rx {
+            Some(ref mut rx) => {
+                match rx.try_recv() {
+                    Ok(None) => (), 
+                    Ok(Some((ib, n))) => {
+                        let ci = ColorImage::from_rgba_unmultiplied([ib.width() as usize, ib.height() as usize], &ib); 
+                        let tex = ctx.load_texture(n.clone(), ci, TextureOptions::LINEAR); 
+                        self.input_image_bi.0 = Some((tex, n)); 
+                    }
+                    Err(_) => {
+                        self.input_image_bi1_rx = None; 
+                        if self.movable_image_display {
+                            self.input_image_bi.0 = None; 
+                        }
+                    } 
+                } 
+            },
+            None => {}, 
+        }
+        match self.input_image_bi2_rx {
+            Some(ref mut rx) => {
+                match rx.try_recv() {
+                    Ok(None) => (), 
+                    Ok(Some((ib, n))) => {
+                        let ci = ColorImage::from_rgba_unmultiplied([ib.width() as usize, ib.height() as usize], &ib); 
+                        let tex = ctx.load_texture(n.clone(), ci, TextureOptions::LINEAR); 
+                        self.input_image_bi.1 = Some((tex, n)); 
+                    }
+                    Err(_) => {
+                        self.input_image_bi2_rx = None; 
+                        if self.movable_image_display {
+                            self.input_image_bi.1 = None; 
+                        }
+                    } 
+                } 
+            },
+            None => {},  
         }
         match self.output_image_singal_rx {
             Some(ref mut rx) => {
@@ -311,6 +354,91 @@ impl App for MyApp {
                 }
             }); 
             ui.separator();
+            ui.add_space(30.); 
+            let can_execute = false; 
+            let r = ui.add_enabled(can_execute, Button::new("Execute"));
+            #[cfg(target_os = "windows")]
+            const DEFAULT_PYTHON_EXECUTOR : &str = "python.exe"; 
+            #[cfg(not(target_os = "windows"))]
+            const DEFAULT_PYTHON_EXECUTOR : &str = "python"; 
+            if r.clicked() {
+                || -> () {
+                    if let Some(ref s) = self.active_py_script {
+                        let mut cmd; 
+                        if self.is_native_mode {
+                            match self.active_native_script {
+                                Some(ref n) => {
+                                    cmd = Command::new(n); 
+                                },
+                                None => {
+                                    return ; 
+                                },
+                            }
+                        } else {
+                            cmd = Command::new(self.py_executor.as_ref().map(|s| s.as_str()).unwrap_or(DEFAULT_PYTHON_EXECUTOR)); 
+                            cmd.arg(s); 
+                        }
+                        cmd.arg("./outcome/result.jpg");
+                        match self.image_mode {
+                            ImageMode::None => (), 
+                            ImageMode::SingleImage => {
+                                if let Some((_, ref n)) = self.input_image_single {
+                                    cmd.arg(n); 
+                                } else {
+                                    return ; 
+                                }
+                            }
+                            ImageMode::BiImage => {
+                                if let Some((_, ref n)) = self.input_image_bi.0 {
+                                    cmd.arg(n); 
+                                } else {
+                                    return ; 
+                                }
+                                if let Some((_, ref n)) = self.input_image_bi.1 {
+                                    cmd.arg(n); 
+                                } else {
+                                    return ; 
+                                } 
+                            }
+                        }
+                        if !self.extra_arguments.is_empty() {
+                            cmd.arg(self.extra_arguments.as_str()); 
+                        }
+                        let (tx, rx) = oneshot::channel(); 
+                        match self.image_mode {
+                            ImageMode::None => {
+                                self.output_image_none_rx = Some(rx);  
+                            }
+                            ImageMode::SingleImage => {
+                                self.output_image_singal_rx = Some(rx);  
+                            }
+                            ImageMode::BiImage => {
+                                self.output_image_bi_rx = Some(rx);   
+                            }
+                        }
+                        thread::spawn(move || {
+                            let mut cmd = cmd; 
+                            let tx = tx; 
+                            let cmd = cmd.status();  
+                            match cmd {
+                                Ok(e) => {
+                                    if e.success() {
+                                        let image = image::open("./outcome/result.jpg"); 
+                                        if let Ok(image) = image {
+                                            let _ = tx.send((image.to_rgba8(), "./outcome/result.jpg".to_string())); 
+                                        } else {
+                                            eprintln!("Error: {:?}", image.err()); 
+                                        } 
+                                    } else {
+                                        eprintln!("Error: {:?}", e);  
+                                    }
+                                },
+                                Err(_) => {},
+                            } 
+                        });
+                    }
+                }(); 
+            }
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Hello World!"); 
@@ -363,6 +491,86 @@ impl App for MyApp {
                         }
                     }
                     ImageMode::BiImage => {
+                        ui.allocate_ui_with_layout([700., 350.].into(), Layout::left_to_right(eframe::emath::Align::Center), |ui| {
+                        // ui.with_layout(Layout::left_to_right(eframe::emath::Align::Center), |ui| {
+                            // add two spinners, and handle the click event for select images 
+                            let click1; 
+                            match self.input_image_bi.0 {
+                                Some((ref t, _)) => {
+                                    let k = ui.add_sized([300., 300.], widgets::ImageButton::new(t, [300., 300.])); 
+                                    click1 = k.clicked(); 
+                                },
+                                None => {
+                                    let u = ui.allocate_response([300., 300.].into(), Sense::click()); 
+                                    ui.put(u.rect, Spinner::new()); 
+                                    click1 = u.clicked(); 
+                                },
+                            } 
+                            let click2; 
+                            match self.input_image_bi.1 {
+                                Some((ref t, _)) => {
+                                    let k = ui.add_sized([300., 300.], widgets::ImageButton::new(t, [300., 300.])); 
+                                    click2 = k.clicked(); 
+                                },
+                                None => {
+                                    let u = ui.allocate_response([300., 300.].into(), Sense::click()); 
+                                    ui.put(u.rect, Spinner::new()); 
+                                    click2 = u.clicked(); 
+                                },
+                            } 
+                            if click1 {
+                                let (tx, rx) = oneshot::channel(); 
+                                self.input_image_bi1_rx = Some(rx); 
+                                std::thread::spawn(move || {
+                                    let task = rfd::AsyncFileDialog::new()
+                                        .set_directory(current_dir().unwrap_or("~".into()))
+                                        .add_filter("Images", &["jpg", "jpeg", "png"])
+                                        .pick_files(); 
+                                    let task = futures::executor::block_on(task); 
+                                    if let Some(path) = task {
+                                        if path.len() != 1 {
+                                            return ; 
+                                        }
+                                        if let Some(path) = path.into_iter().nth(0) {
+                                            let path_str = path.path().to_string_lossy().into_owned(); 
+                                            let image = image::open(path.path()); 
+                                            if let Ok(image) = image {
+                                                let _ = tx.send((image.to_rgba8(), path_str)); 
+                                            } else {
+                                                eprintln!("Error: {:?}", image.err()); 
+                                            } 
+                                            return ; 
+                                        }
+                                    } 
+                                });  
+                            } 
+                            if click2 {
+                                let (tx, rx) = oneshot::channel(); 
+                                self.input_image_bi2_rx = Some(rx); 
+                                std::thread::spawn(move || {
+                                    let task = rfd::AsyncFileDialog::new()
+                                        .set_directory(current_dir().unwrap_or("~".into()))
+                                        .add_filter("Images", &["jpg", "jpeg", "png"])
+                                        .pick_files(); 
+                                    let task = futures::executor::block_on(task); 
+                                    if let Some(path) = task {
+                                        if path.len() != 1 {
+                                            return ; 
+                                        }
+                                        if let Some(path) = path.into_iter().nth(0) {
+                                            let path_str = path.path().to_string_lossy().into_owned(); 
+                                            let image = image::open(path.path()); 
+                                            if let Ok(image) = image {
+                                                let _ = tx.send((image.to_rgba8(), path_str)); 
+                                            } else {
+                                                eprintln!("Error: {:?}", image.err()); 
+                                            } 
+                                            return ; 
+                                        }
+                                    } 
+                                }); 
+                            }
+                        });
                     }
                 }
             }); 
