@@ -1,277 +1,371 @@
-use std::{path::PathBuf, sync::mpsc, process, borrow::Cow, env::current_dir};
+use std::env::current_dir;
+use std::ffi::OsString;
+use std::time::Duration;
 
-use eframe::{egui::{CentralPanel, widgets, TextureOptions, Spinner, SidePanel, ScrollArea}, epaint::{TextureId, ColorImage, TextureHandle}};
+use eframe::App;
+use eframe::egui::{SidePanel, RichText, Button, Layout, Spinner, widgets, TextureOptions, Sense};
+use eframe::egui;
+use eframe::epaint::{TextureHandle, ColorImage};
+use futures::channel::mpsc::{Receiver, Sender};
+use futures::channel::oneshot;
 use image::{ImageBuffer, Rgba};
+use image_transfer::image_mode::ImageMode;
 
-use arboard::Clipboard; 
+const PY_SCRIPT_FLUSH_TIME : Duration = Duration::from_secs(1); 
+const NORMAL_SCRIPT_FLUSH_TIME : Duration = Duration::from_secs(1); 
+const TIME_SLICE : Duration = Duration::from_millis(100); 
 
-fn main() {
+pub fn main() {
+    println!("Hello, world!"); 
+    // Python scripts checking 
+    let (py_script_updates_tx, py_script_updates_rx) = futures::channel::mpsc::channel(1); 
+    let (py_script_checker_tx, py_script_checker_rx) = futures::channel::mpsc::channel(1); 
+    std::thread::spawn(move || {
+        let mut py_script_updates_tx = py_script_updates_tx; 
+        let mut py_script_checker_rx = py_script_checker_rx; 
+        let mut clock : Duration = Duration::from_secs(0); 
+        let mut is_flush; 
+        loop {
+            is_flush = false; 
+            match py_script_checker_rx.try_next() {
+                Ok(Some(())) => {
+                    is_flush = true;  
+                }
+                Ok(None) => break, 
+                _ => (),
+            } 
+            clock += TIME_SLICE; 
+            if clock >= PY_SCRIPT_FLUSH_TIME || is_flush {
+                clock = Duration::from_secs(0); 
+            } else {
+                std::thread::sleep(TIME_SLICE); 
+                continue; 
+            } 
+            let read_dir = std::fs::read_dir("./pyscripts"); 
+            let s; 
+            match read_dir {
+                Ok(dir) => {
+                    let v : Vec<_> = 
+                        dir.into_iter().flat_map(|f| f.ok().map(|f| f.path())).filter(|f| f.extension() == Some("py".as_ref()))
+                            .map(OsString::from)
+                            .map(|f| f.to_string_lossy().into_owned())
+                            .collect(); 
+                    s = py_script_updates_tx.try_send(v); 
+                }
+                Err(_) => {
+                    s = py_script_updates_tx.try_send(Vec::new()); 
+                }
+            }
+            let _ = s; 
+        }
+        dbg!("python scripts checking thread exit.");
+    }); 
+    // Native scripts checking 
+    let (native_script_updates_tx, native_script_updates_rx) = futures::channel::mpsc::channel(1); 
+    let (native_script_checker_tx, native_script_checker_rx) = futures::channel::mpsc::channel(1); 
+    std::thread::spawn(move || {
+        let mut native_script_updates_tx = native_script_updates_tx; 
+        let mut native_script_checker_rx = native_script_checker_rx; 
+        let mut clock : Duration = Duration::from_secs(0); 
+        let mut is_flush; 
+        loop {
+            is_flush = false; 
+            match native_script_checker_rx.try_next() {
+                Ok(Some(())) => {
+                    is_flush = true;  
+                }
+                Err(_) => break, 
+                _ => (),
+            } 
+            clock += TIME_SLICE; 
+            if clock >= NORMAL_SCRIPT_FLUSH_TIME || is_flush {
+                clock = Duration::from_secs(0); 
+            } else {
+                std::thread::sleep(TIME_SLICE); 
+                continue; 
+            } 
+            let read_dir = std::fs::read_dir("./nativescripts"); 
+            let s; 
+            match read_dir {
+                Ok(dir) => {
+                    let v : Vec<_> = 
+                        dir.into_iter().flat_map(|f| f.ok().map(|f| f.path())).filter(|f| f.extension() == Some("rs".as_ref()))
+                            .map(OsString::from)
+                            .map(|f| f.to_string_lossy().into_owned())
+                            .collect(); 
+                    s = native_script_updates_tx.try_send(v); 
+                }
+                Err(_) => {
+                    s = native_script_updates_tx.try_send(Vec::new()); 
+                }
+            }
+            if s.is_err() {
+                break; 
+            }
+        }
+    }); 
+    let app = MyApp {
+        py_script_updates: (py_script_updates_rx, py_script_checker_tx), 
+        native_script_updates: (native_script_updates_rx, native_script_checker_tx), 
+        active_py_script: None, 
+        active_native_script: None, 
+        py_executor: None, 
+        is_native_mode: false,
+        py_lists: Vec::new(), 
+        native_lists: Vec::new(),
+        image_mode: ImageMode::BiImage,
+        input_image_single: None,
+        input_image_bi: (None, None), 
+        output_image_none: None,
+        output_image_single: None,
+        output_image_bi: None,
+        input_image_singal_rx: None, 
+        output_image_singal_rx: None,
+        output_image_none_rx: None,
+        input_image_bi1_rx: None, 
+        input_image_bi2_rx: None, 
+        output_image_bi_rx: None,
+        movable_image_display: false, 
+    }; 
     let mut native_options = eframe::NativeOptions::default(); 
-    native_options.initial_window_size = Some(eframe::egui::Vec2::new(850.0, 700.0)); 
-    eframe::run_native( "Image Style Transfer", native_options, Box::new( 
-        |_| Box::new( App {
-            content_texture_id: None, 
-            style_texture_id: None, 
-            result_texture_id: None, 
-            size : 300.0, 
-            result_channel: None,
-            content_path: None, 
-            style_path: None,
-            content_channel: None, 
-            style_channel: None,
-            selected: None,
-            files: Vec::new(), 
-            tick: 0, 
-        } ) 
-    )).unwrap(); 
+    native_options.initial_window_size = Some(egui::Vec2::new(1024.0, 768.0)); 
+    eframe::run_native("Image Transfer", native_options, Box::new( |_| Box::new(app))).unwrap(); 
 }
 
-pub struct App {
-    content_channel: Option<mpsc::Receiver<(ImageBuffer<Rgba<u8>, Vec<u8>>, PathBuf)>>, 
-    style_channel: Option<mpsc::Receiver<(ImageBuffer<Rgba<u8>, Vec<u8>>, PathBuf)>>, 
-    result_channel: Option<mpsc::Receiver<ImageBuffer<Rgba<u8>, Vec<u8>>>>, 
-    content_texture_id: Option<TextureHandle>,
-    style_texture_id: Option<TextureHandle>, 
-    result_texture_id : Option<TextureHandle>,
-    size: f32, 
-    content_path: Option<PathBuf>,
-    style_path: Option<PathBuf>, 
-    selected: Option<PathBuf>, 
-    files: Vec<PathBuf>,
-    tick: u128, 
+pub struct MyApp {
+    /// Python 脚本更新线程
+    pub py_script_updates: (Receiver<Vec<String>>, Sender<()>), 
+    /// Native 脚本更新线程 
+    pub native_script_updates: (Receiver<Vec<String>>, Sender<()>), 
+    /// 当前激活的 Python 脚本 
+    pub active_py_script: Option<String>, 
+    /// 当前激活的 Native 脚本 
+    pub active_native_script: Option<String>, 
+    /// 当前使用的 Python 解释器路径；None 则尝试本路径下的 python 程序 / python.exe (in windows)
+    pub py_executor : Option<String>, 
+    /// 当前模式：Python 或 Native 
+    pub is_native_mode: bool, 
+    /// 当前 Python 脚本列表
+    pub py_lists: Vec<String>, 
+    /// 当前 native 脚本列表
+    pub native_lists: Vec<String>, 
+    /// 当前图像模式
+    pub image_mode: ImageMode, 
+    /// 当前的输入图像 
+    pub input_image_single: Option<(TextureHandle, String)>, 
+    /// 当前的输出图像 模式 2 
+    pub input_image_bi: (Option<(TextureHandle, String)>, Option<(TextureHandle, String)>), 
+    /// 当前的输出图像 None 
+    pub output_image_none: Option<(TextureHandle, String)>, 
+    /// 当前的输出图像 模式 1 
+    pub output_image_single: Option<(TextureHandle, String)>, 
+    /// 当前的输出图像 模式 2 
+    pub output_image_bi: Option<(TextureHandle, String)>, 
+    /// single 模式输入图像通道 
+    pub input_image_singal_rx: Option<oneshot::Receiver<(ImageBuffer<Rgba<u8>, Vec<u8>>, String)>>, 
+    /// single 模式输出图像通道
+    pub output_image_singal_rx: Option<oneshot::Receiver<(ImageBuffer<Rgba<u8>, Vec<u8>>, String)>>, 
+    /// None 模式输出图像通道
+    pub output_image_none_rx: Option<oneshot::Receiver<(ImageBuffer<Rgba<u8>, Vec<u8>>, String)>>, 
+    /// bi 模式输入图像通道 1 
+    pub input_image_bi1_rx: Option<oneshot::Receiver<(ImageBuffer<Rgba<u8>, Vec<u8>>, String)>>, 
+    /// bi 模式输入图像通道 2 
+    pub input_image_bi2_rx: Option<oneshot::Receiver<(ImageBuffer<Rgba<u8>, Vec<u8>>, String)>>, 
+    /// bi 模式输出图像通道 
+    pub output_image_bi_rx: Option<oneshot::Receiver<(ImageBuffer<Rgba<u8>, Vec<u8>>, String)>>, 
+    /// 可移除已经装载的任务
+    pub movable_image_display: bool, 
 }
 
-pub enum ImagePath {
-    Content, 
-    Style,
-}
-
-impl eframe::App for App {
-    fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(path_channel) = &mut self.content_channel {
-            if let Ok((t, p)) = path_channel.try_recv() {
-                // load the image 
-                let ci = ColorImage::from_rgba_unmultiplied([t.width() as usize, t.height() as usize], &t); 
-                let texture_id = ctx.load_texture("content", ci, TextureOptions::LINEAR); 
-                self.content_texture_id = Some(texture_id);
-                self.content_path = Some(p);
-
-            }  
-        }
-        if let Some(path_channel) = &mut self.style_channel {
-            if let Ok((t, p)) = path_channel.try_recv() {
-                // load the image 
-                let ci = ColorImage::from_rgba_unmultiplied([t.width() as usize, t.height() as usize], &t); 
-                let texture_id = ctx.load_texture("style", ci, TextureOptions::LINEAR); 
-                self.style_texture_id = Some(texture_id);
-                self.style_path = Some(p);
-            }  
-        }
-        if let Some(result_channel) = &mut self.result_channel {
-            if let Ok(t) = result_channel.try_recv() {
-                let image = t; 
-                let ci = ColorImage::from_rgba_unmultiplied([image.width() as usize, image.height() as usize], &image);
-                let texture_id = ctx.load_texture("result", ci, TextureOptions::LINEAR);
-                self.result_texture_id = Some(texture_id); 
+impl App for MyApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 检查 Python 脚本更新 
+        match self.py_script_updates.0.try_next() {
+            Ok(Some(v)) => {
+                self.py_lists = v; 
             }
-        }
-        if self.tick % 300 == 0 {
-            let files = std::fs::read_dir("./src"); 
-            if let Ok(files) = files {
-                let mut files = files.map(|x| x.unwrap().path())
-                    .filter(|x| x.extension() == Some(std::ffi::OsStr::new("py")))
-                    .collect::<Vec<_>>(); 
-                files.sort(); 
-                self.files = files;  
-            }
+            _ => (),
         } 
-        SidePanel::left("script_active").show(ctx, |ui| {
-            ScrollArea::vertical().show(ui, |ui| {
-                for file in &self.files {
-                    let is_eq = self.selected.as_ref().map(|x| x == file).unwrap_or(false); 
-                    let button = ui.add(widgets::SelectableLabel::new(is_eq, file.to_string_lossy())); 
-                    if button.clicked() {
-                        self.selected = Some(file.clone()); 
+        // 检查 Native 脚本更新 
+        match self.native_script_updates.0.try_next() {
+            Ok(Some(v)) => {
+                self.native_lists = v; 
+            }
+            _ => (),
+        } 
+        match self.input_image_singal_rx {
+            Some(ref mut rx) => {
+                match rx.try_recv() {
+                    Ok(None) => (), 
+                    Ok(Some((ib, n))) => {
+                        let ci = ColorImage::from_rgba_unmultiplied([ib.width() as usize, ib.height() as usize], &ib); 
+                        let tex = ctx.load_texture(n.clone(), ci, TextureOptions::LINEAR); 
+                        self.input_image_single = Some((tex, n)); 
                     }
+                    Err(_) => {
+                        self.input_image_singal_rx = None; 
+                        if self.movable_image_display {
+                            self.input_image_single = None; 
+                        }
+                    } 
+                } 
+            },
+            None => {},
+        }
+        match self.output_image_singal_rx {
+            Some(ref mut rx) => {
+                match rx.try_recv() {
+                    Ok(None) => (),
+                    Ok(Some((ib, n))) => {
+                        let ci = ColorImage::from_rgba_unmultiplied([ib.width() as usize, ib.height() as usize], &ib); 
+                        let tex = ctx.load_texture(n.clone(), ci, TextureOptions::LINEAR); 
+                        self.output_image_single = Some((tex, n)); 
+                    },
+                    Err(_) => {
+                        self.output_image_singal_rx = None; 
+                        if self.movable_image_display {
+                            self.output_image_single = None; 
+                        } 
+                    },
+                } 
+            },
+            None => {},
+        }
+        match self.output_image_none_rx {
+            Some(ref mut rx) => {
+                match rx.try_recv() {
+                    Ok(None) => (), 
+                    Ok(Some((ib, n))) => {
+                        let ci = ColorImage::from_rgba_unmultiplied([ib.width() as usize, ib.height() as usize], &ib); 
+                        let tex = ctx.load_texture(n.clone(), ci, TextureOptions::LINEAR); 
+                        self.output_image_none = Some((tex, n)); 
+                    },
+                    Err(_) => {
+                        self.output_image_none_rx = None; 
+                        if self.movable_image_display {
+                            self.output_image_none = None; 
+                        } 
+                    },
+                } 
+            },
+            None => {}, 
+        }
+        SidePanel::left("script_panel").show(ctx, |ui| {
+            let display_python = !self.is_native_mode; 
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                if display_python {
+                    for py in self.py_lists.iter() {
+                        let select = self.active_py_script.as_ref().map(|s| s == py).unwrap_or(false); 
+                        let select = ui.selectable_label(select, py); 
+                        if select.clicked() {
+                            self.active_py_script = Some(py.clone());  
+                        }
+                    }
+                } else {
+                    for native in self.native_lists.iter() {
+                        let select = self.active_native_script.as_ref().map(|s| s == native).unwrap_or(false); 
+                        let select = ui.selectable_label(select, native); 
+                        if select.clicked() {
+                            self.active_native_script = Some(native.clone());  
+                        }
+                    }  
                 }
             });
         });
-        CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| ui.heading("Image Style Transfer"));
-            // ui.heading("Image Style Transfer"); 
-            ui.vertical_centered(|ui| {
-                ui.horizontal(|ui| {
-                    // add a box, with a middle button (if non image is loaded), or clickable image (if image is loaded) 
-                    let click = ui.add(widgets::ImageButton::new(
-                        if let Some(id) = &self.content_texture_id {
-                            id.id()
-                        } else {
-                            TextureId::default()
-                        }, (self.size, self.size))
-                    ); 
-                    if click.clicked() {
-                        // open a file dialog, and load the image 
-                        let task = rfd::AsyncFileDialog::new()
-                            .set_directory(current_dir().unwrap_or(".".into()))
-                            .add_filter("Images", &["jpg", "jpeg", "png"])
-                            .pick_files(); 
-                        let (tx, rx) = mpsc::channel(); 
-                        self.content_channel = Some(rx); 
-                        std::thread::spawn(move || {
-                            let task = futures::executor::block_on(task); 
-                            if let Some(path) = task {
-                                dbg!(&path);
-                                if let Some(path) = path.into_iter().nth(0) {
-                                    let image = image::open(path.path()); 
-                                    if let Ok(image) = image {
-                                        let _ = tx.send((image.to_rgba8(), PathBuf::from(path.path()))); 
-                                    } else {
-                                        eprintln!("Error: {:?}", image.err()); 
-                                    } 
-                                    return ; 
-                                }
-                            } 
-                        }); 
-                    } 
-                    
-                    // add a box, with a middle button (if non image is loaded), or clickable image (if image is loaded) 
-                    let click = ui.add(widgets::ImageButton::new(
-                        if let Some(id) = &self.style_texture_id {
-                            id.id()
-                        } else {
-                            TextureId::default()
-                        }, (self.size, self.size))
-                    ); 
-                    if click.clicked() {
-                        // open a file dialog, and load the image 
-                        let task = rfd::AsyncFileDialog::new()
-                            .set_directory(current_dir().unwrap_or(".".into()))
-                            .add_filter("Images", &["jpg", "jpeg", "png"])
-                            .pick_files(); 
-                        let (tx, rx) = mpsc::channel(); 
-                        self.style_channel = Some(rx); 
-                        std::thread::spawn(move || {
-                            let task = futures::executor::block_on(task); 
-                            if let Some(path) = task {
-                                if let Some(path) = path.into_iter().nth(0) {
-                                    let image = image::open(path.path()); 
-                                    if let Ok(image) = image {
-                                        let _ = tx.send((image.to_rgba8(), PathBuf::from(path.path()))); 
-                                    } else {
-                                        eprintln!("Error: {:?}", image.err()); 
-                                    } 
-                                    return ; 
-                                }
-                            } 
-                        }); 
-                    } 
-                }); 
-            });
-            let p = ui.button("Transfer").on_hover_text("Transfer the style of the style image to the content image");
-            if p.clicked() {
-                let (tx, rx) = mpsc::channel(); 
-                self.result_channel = Some(rx); 
-                let p; 
-                match (&self.content_path, &self.style_path) {
-                    (Some(content_path), Some(style_path)) => {
-                        p = Some((content_path.clone(), style_path.clone())); 
-                    },
-                    (Some(content_path), None) => {
-                        p = Some((content_path.clone(), content_path.clone())); 
-                    },
-                    _ => {
-                        p = None;  
-                    }
-                } 
-                'big_if: {
-                    if let Some((p1, p2)) = p {
-                        let ps1; 
-                        let ps2; 
-                        if let Some(p1) = p1.to_str() {
-                            ps1 = p1; 
-                        } else {
-                            break 'big_if;         
-                        }
-                        if let Some(p2) = p2.to_str() {
-                            ps2 = p2; 
-                        } else {
-                            break 'big_if; 
-                        } 
-                        let ps1 = ps1.to_string(); 
-                        let ps2 = ps2.to_string(); 
-                        dbg!(&ps1); 
-                        dbg!(&ps2);
-                        let select = self.selected.clone(); 
-                        dbg!(&select);
-                        std::thread::spawn(move || {
-                            println!("executing python script");
-                            // execute! 
-                            #[cfg(target_os = "windows")]
-                            const EXECUTABLE: &str = "python.exe"; 
-                            #[cfg(not(target_os = "windows"))]
-                            const EXECUTABLE: &str = "python"; 
-                            let s; 
-                            if let Some(select) = select {
-                                s = select; 
-                            } else {
-                                return ; 
-                            }
-                            let file_name = s.file_name().unwrap_or_default().to_string_lossy().to_string(); 
-                            let file_name = format!("src/{}", file_name);
-                            let progress = process::Command::new(EXECUTABLE)
-                                .arg(&file_name)
-                                .arg("res/output.jpg")
-                                .arg(format!("file://{}", ps1))
-                                .arg(format!("file://{}", ps2))
-                                .spawn(); 
-                            match progress {
-                                Ok(mut c) => {
-                                    let r = c.wait();
-                                    if let Ok(r) = r {
-                                        dbg!(&r); 
-                                        if !r.success() {
-                                            return 
-                                        }
-                                        let image = image::open("res/output.jpg"); 
-                                        if let Ok(image) = image {
-                                            let _ = tx.send(image.to_rgba8()); 
-                                        } 
-                                    }
-                                },
-                                Err(err) => {
-                                    dbg!(err);  
-                                },
-                            }
-                        });
-                    }
-
-                }
-            }
-            if let Some(id) = &self.result_texture_id {
-                let click = ui.add(widgets::ImageButton::new(id.id(), (self.size, self.size))); 
-                if click.clicked() {
-                    std::thread::spawn(|| {
-                        let clipboard = Clipboard::new(); 
-                        if let Ok(mut clip) = clipboard {
-                            let image = image::open("res/output.jpg");
-                            if let Ok(image) = image {
-                                let image = image.to_rgba8(); 
-                                let _ = clip.set_image(arboard::ImageData {
-                                    width: image.width() as usize,
-                                    height: image.height() as usize, 
-                                    bytes: {
-                                        let i: Vec<_> = image.into_raw().into_iter().map(|x| x as u8).collect(); 
-                                        Cow::Owned(i)
-                                    }
-                                }); 
-                            } 
-                        }
-                    }); 
-                } 
+        SidePanel::right("options_panel").min_width(110.).default_width(110.).show(ctx, |ui| {
+            let text: RichText; 
+            if self.is_native_mode {
+                text = "Native Mode".into(); 
             } else {
-                // waiting scrolling animations 
-                ui.add_sized([self.size, self.size], Spinner::new());
+                text = "Python Mode".into();  
             }
+            ui.add_space(10.);
+            ui.label("Mode: ");
+            let selected = ui.add(egui::Button::new(text).min_size([90.0, 25.0].into())); 
+            if selected.clicked() {
+                self.is_native_mode = !self.is_native_mode; 
+            }
+            ui.separator(); 
+            ui.add_space(10.); 
+            let flush = ui.add(Button::new("Flush Scripts").min_size([90.0, 25.0].into())
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 0, 0))));
+            if flush.clicked() { 
+                if self.is_native_mode {
+                    let _ = self.native_script_updates.1.try_send(()); 
+                } else {
+                    let _ = self.py_script_updates.1.try_send(()); 
+                } 
+            } 
+            ui.add_space(40.); 
+            ui.label("Image Input Mode: "); 
+            ui.separator(); 
+            ui.radio_value(&mut self.image_mode, ImageMode::None, "None Image Mode");  
+            ui.radio_value(&mut self.image_mode, ImageMode::SingleImage, "Single Image Mode"); 
+            ui.radio_value(&mut self.image_mode, ImageMode::BiImage, "Bi-Image Mode");  
+            ui.add_space(30.); 
+            ui.horizontal(|ui| {
+                ui.label("Image Unload Allowed: ");
+                let c = ui.selectable_label(self.movable_image_display, "Yes");
+                if c.clicked() {
+                    self.movable_image_display = !self.movable_image_display; 
+                }
+            }); 
+            ui.separator();
+        });
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Hello World!"); 
+            ui.with_layout(Layout::top_down_justified(eframe::emath::Align::Center), |ui| {
+                match self.image_mode {
+                    ImageMode::None => {
+                        ui.label("[Mode] No Image Selected. ");
+                    }
+                    ImageMode::SingleImage => {
+                        let click; 
+                        match self.input_image_single {
+                            Some((ref t, _)) => {
+                                // ui.image(t, [300., 300.]);
+                                let k = ui.add_sized([300., 300.], widgets::ImageButton::new(t, [300., 300.])); 
+                                click = k.clicked(); 
+                            },
+                            None => {
+                                let u = ui.allocate_response([300., 300.].into(), Sense::click()); 
+                                ui.put(u.rect, Spinner::new()); 
+                                click = u.clicked(); 
+                                // click = ui.add_sized([300., 300.], Spinner::new()); 
+                            },
+                        }
+                        if click {
+                            let (tx, rx) = oneshot::channel(); 
+                            self.input_image_singal_rx = Some(rx); 
+                            std::thread::spawn(move || {
+                                let task = rfd::AsyncFileDialog::new()
+                                    .set_directory(current_dir().unwrap_or("~".into()))
+                                    .add_filter("Images", &["jpg", "jpeg", "png"])
+                                    .pick_files(); 
+                                let task = futures::executor::block_on(task); 
+                                // dbg!(&task);
+                                if let Some(path) = task {
+                                    if path.len() != 1 {
+                                        return ; 
+                                    }
+                                    if let Some(path) = path.into_iter().nth(0) {
+                                        let path_str = path.path().to_string_lossy().into_owned(); 
+                                        let image = image::open(path.path()); 
+                                        if let Ok(image) = image {
+                                            let _ = tx.send((image.to_rgba8(), path_str)); 
+                                        } else {
+                                            eprintln!("Error: {:?}", image.err()); 
+                                        } 
+                                        return ; 
+                                    }
+                                } 
+                            }); 
+                        }
+                    }
+                    ImageMode::BiImage => {
+                    }
+                }
+            }); 
         }); 
     }
 }
