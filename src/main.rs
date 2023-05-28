@@ -1,9 +1,11 @@
+use std::borrow::Cow;
 use std::env::current_dir;
 use std::ffi::OsString;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+use arboard::Clipboard;
 use eframe::App;
 use eframe::egui::{SidePanel, RichText, Button, Layout, Spinner, widgets, TextureOptions, Sense};
 use eframe::egui;
@@ -331,7 +333,7 @@ impl App for MyApp {
             ui.separator(); 
             ui.add_space(10.); 
             let flush = ui.add(Button::new("Flush Scripts").min_size([90.0, 25.0].into())
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 0, 0))));
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 45, 0))));
             if flush.clicked() { 
                 if self.is_native_mode {
                     let _ = self.native_script_updates.1.try_send(()); 
@@ -355,7 +357,22 @@ impl App for MyApp {
             }); 
             ui.separator();
             ui.add_space(30.); 
-            let can_execute = false; 
+            let mut can_execute: bool; 
+            can_execute = match self.is_native_mode {
+                true => self.active_native_script.is_some(), 
+                false => self.active_py_script.is_some(), 
+            }; 
+            if can_execute {
+                match self.image_mode {
+                    ImageMode::None => (), 
+                    ImageMode::SingleImage => {
+                        can_execute = self.input_image_single.is_some();  
+                    }
+                    ImageMode::BiImage => {
+                        can_execute = self.input_image_bi.0.is_some() && self.input_image_bi.1.is_some(); 
+                    }
+                }
+            }
             let r = ui.add_enabled(can_execute, Button::new("Execute"));
             #[cfg(target_os = "windows")]
             const DEFAULT_PYTHON_EXECUTOR : &str = "python.exe"; 
@@ -459,7 +476,6 @@ impl App for MyApp {
                                 let u = ui.allocate_response([300., 300.].into(), Sense::click()); 
                                 ui.put(u.rect, Spinner::new()); 
                                 click = u.clicked(); 
-                                // click = ui.add_sized([300., 300.], Spinner::new()); 
                             },
                         }
                         if click {
@@ -573,6 +589,74 @@ impl App for MyApp {
                         });
                     }
                 }
+                ui.separator(); 
+                ui.with_layout(Layout::left_to_right(eframe::emath::Align::Center), |ui| {
+                    let click; 
+                    // display the result 
+                    match self.image_mode {
+                        ImageMode::None => {
+                            match self.output_image_none {
+                                Some((ref t, _)) => {
+                                    let c = ui.add_sized([300., 300.], widgets::ImageButton::new(t, [300., 300.])); 
+                                    click = c.clicked(); 
+                                },
+                                None => {
+                                    let u = ui.allocate_response([300., 300.].into(), Sense::click()); 
+                                    ui.put(u.rect, Spinner::new()); 
+                                    click = u.clicked(); 
+                                }, 
+                            }
+                        }
+                        ImageMode::SingleImage => {
+                            match self.output_image_single {
+                                Some((ref t, _)) => {
+                                    let c = ui.add_sized([300., 300.], widgets::ImageButton::new(t, [300., 300.])); 
+                                    click = c.clicked(); 
+                                },
+                                None => {
+                                    let u = ui.allocate_response([300., 300.].into(), Sense::click()); 
+                                    ui.put(u.rect, Spinner::new()); 
+                                    click = u.clicked(); 
+                                }, 
+                            } 
+                        }
+                        ImageMode::BiImage => {
+                            match self.output_image_bi {
+                                Some((ref t, _)) => {
+                                    let c = ui.add_sized([300., 300.], widgets::ImageButton::new(t, [300., 300.])); 
+                                    click = c.clicked(); 
+                                },
+                                None => {
+                                    let u = ui.allocate_response([300., 300.].into(), Sense::click()); 
+                                    ui.put(u.rect, Spinner::new()); 
+                                    click = u.clicked(); 
+                                }, 
+                            }  
+                        }
+                    }
+                    if click {
+                        // copy the image to clipboard 
+                        thread::spawn(|| {
+                            let clipboard = Clipboard::new(); 
+                            let mut clip; 
+                            match clipboard {
+                                Ok(c) => clip = c, 
+                                Err(_) => return ,
+                            }
+                            // open image from './outcome/result.jpg' 
+                            let image = image::open("./outcome/result.jpg"); 
+                            if let Ok(image) = image {
+                                let image = image.to_rgba8(); 
+                                let _ = clip.set_image(arboard::ImageData { width: image.width() as usize, height: image.height() as usize, bytes: {
+                                    let c = image.into_raw().into_iter().map(|a| a as u8).collect();
+                                    Cow::Owned(c)
+                                } }); 
+                            } else {
+                                eprintln!("Error: {:?}", image.err()); 
+                            }  
+                        });
+                    }
+                });
             }); 
         }); 
     }
