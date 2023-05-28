@@ -591,6 +591,7 @@ impl App for MyApp {
                 }
                 ui.separator(); 
                 ui.with_layout(Layout::left_to_right(eframe::emath::Align::Center), |ui| {
+                    let mut exist = false; 
                     let click; 
                     // display the result 
                     match self.image_mode {
@@ -598,6 +599,7 @@ impl App for MyApp {
                             match self.output_image_none {
                                 Some((ref t, _)) => {
                                     let c = ui.add_sized([300., 300.], widgets::ImageButton::new(t, [300., 300.])); 
+                                    exist = true; 
                                     click = c.clicked(); 
                                 },
                                 None => {
@@ -611,6 +613,7 @@ impl App for MyApp {
                             match self.output_image_single {
                                 Some((ref t, _)) => {
                                     let c = ui.add_sized([300., 300.], widgets::ImageButton::new(t, [300., 300.])); 
+                                    exist = true; 
                                     click = c.clicked(); 
                                 },
                                 None => {
@@ -624,6 +627,7 @@ impl App for MyApp {
                             match self.output_image_bi {
                                 Some((ref t, _)) => {
                                     let c = ui.add_sized([300., 300.], widgets::ImageButton::new(t, [300., 300.])); 
+                                    exist = true; 
                                     click = c.clicked(); 
                                 },
                                 None => {
@@ -634,7 +638,7 @@ impl App for MyApp {
                             }  
                         }
                     }
-                    if click {
+                    if exist && click {
                         // copy the image to clipboard 
                         thread::spawn(|| {
                             let clipboard = Clipboard::new(); 
