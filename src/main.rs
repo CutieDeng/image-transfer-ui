@@ -62,7 +62,7 @@ pub fn main() {
             }
             let _ = s; 
         }
-        dbg!("python scripts checking thread exit.");
+        eprintln!("python scripts checking thread exit.");
     }); 
     // Native scripts checking 
     let (native_script_updates_tx, native_script_updates_rx) = futures::channel::mpsc::channel(1); 
@@ -295,6 +295,25 @@ impl App for MyApp {
             },
             None => {}, 
         }
+        match self.output_image_bi_rx {
+            Some(ref mut rx) => {
+                match rx.try_recv() {
+                    Ok(None) => (), 
+                    Ok(Some((ib, n))) => {
+                        let ci = ColorImage::from_rgba_unmultiplied([ib.width() as usize, ib.height() as usize], &ib); 
+                        let tex = ctx.load_texture(n.clone(), ci, TextureOptions::LINEAR); 
+                        self.output_image_bi = Some((tex, n)); 
+                    },
+                    Err(_) => {
+                        self.output_image_bi_rx = None; 
+                        if self.movable_image_display {
+                            self.output_image_bi = None; 
+                        } 
+                    },
+                } 
+            },
+            None => {},  
+        }
         SidePanel::left("script_panel").show(ctx, |ui| {
             let display_python = !self.is_native_mode; 
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -375,9 +394,9 @@ impl App for MyApp {
             }
             let r = ui.add_enabled(can_execute, Button::new("Execute"));
             #[cfg(target_os = "windows")]
-            const DEFAULT_PYTHON_EXECUTOR : &str = "python.exe"; 
+            const DEFAULT_PYTHON_EXECUTOR : &str = "./python.exe"; 
             #[cfg(not(target_os = "windows"))]
-            const DEFAULT_PYTHON_EXECUTOR : &str = "python"; 
+            const DEFAULT_PYTHON_EXECUTOR : &str = "./python"; 
             if r.clicked() {
                 || -> () {
                     if let Some(ref s) = self.active_py_script {
@@ -450,12 +469,19 @@ impl App for MyApp {
                                         eprintln!("Error: {:?}", e);  
                                     }
                                 },
-                                Err(_) => {},
+                                Err(e) => {
+                                    eprintln!("Error: {:?}", e);  
+                                },
                             } 
                         });
                     }
                 }(); 
             }
+            ui.separator(); 
+            ui.add_space(20.); 
+            ui.label("Extra Arguments: "); 
+            ui.separator(); 
+            ui.text_edit_singleline(&mut self.extra_arguments); 
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Hello World!"); 
@@ -590,7 +616,7 @@ impl App for MyApp {
                     }
                 }
                 ui.separator(); 
-                ui.with_layout(Layout::left_to_right(eframe::emath::Align::Center), |ui| {
+                ui.with_layout(Layout::top_down(eframe::emath::Align::Center), |ui| {
                     let mut exist = false; 
                     let click; 
                     // display the result 
